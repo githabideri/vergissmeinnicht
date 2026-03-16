@@ -11,7 +11,11 @@
 # Usage: ./morning-pipeline.sh [--dry-run]
 # Cron:  0 6 * * * /path/to/scripts/morning-pipeline.sh
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: We intentionally do NOT use set -e here.
+# The orchestrator handles failures gracefully per-phase,
+# not crashing on the first non-zero exit code.
+# See docs/design-decisions.md §5 (Graceful Degradation).
 
 # ──────────────────────────────────────────
 # Configuration
@@ -27,13 +31,24 @@ if [ -f "$REPO_DIR/config.env" ]; then
 fi
 
 DATE=$(date +%Y-%m-%d)
+YESTERDAY=$(date -d yesterday +%Y-%m-%d 2>/dev/null || date -v-1d +%Y-%m-%d)
 LOG_DIR="${LOG_DIR:-$REPO_DIR/logs}"
 LOG="${LOG_DIR}/morning-pipeline-${DATE}.log"
+DEBUG_LOG="${LOG_DIR}/morning-pipeline-${DATE}-debug.log"
 AGENT_MEMORY_DIR="${AGENT_MEMORY_DIR:-$REPO_DIR/agents}"
 SUMMARY_DIR="${SUMMARY_DIR:-$REPO_DIR/summaries}"
-DRY_RUN="${1:-}"
-STATUS="ok"
+DRY_RUN=""
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN="true"
+
+# Track pipeline status via temp file — NOT a bash variable.
+# Bash subshells (background processes) can't propagate variable changes
+# to the parent. Using a temp file ensures set_degraded() works from
+# any phase, even when running in a ( ) & background subshell.
+STATUS_FILE=$(mktemp)
+echo "ok" > "$STATUS_FILE"
+
 AGENT_NOTES_AVAILABLE=false
+PHASE_RESULTS=()
 
 # Ensure directories
 mkdir -p "$LOG_DIR"
@@ -45,6 +60,14 @@ mkdir -p "$SUMMARY_DIR"
 
 log() {
     echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"
+}
+
+set_degraded() {
+    echo "degraded" > "$STATUS_FILE"
+}
+
+get_status() {
+    cat "$STATUS_FILE"
 }
 
 run_with_retry() {
@@ -59,7 +82,7 @@ run_with_retry() {
             return 0
         fi
 
-        if timeout "$timeout_s" bash -c "$cmd" 2>&1 | tee -a "$LOG"; then
+        if timeout "$timeout_s" bash -c "$cmd" >> "$DEBUG_LOG" 2>&1; then
             return 0
         fi
 
@@ -79,7 +102,7 @@ run_with_retry() {
 
 log "════════════════════════════════════════"
 log "💙 vergissmeinnicht — Morning Pipeline"
-log "   Date: $DATE"
+log "   Date: $DATE (yesterday: $YESTERDAY)"
 [ -n "$DRY_RUN" ] && log "   Mode: DRY-RUN"
 log "════════════════════════════════════════"
 
@@ -90,25 +113,31 @@ log "🔥 Phase 0: Warmup + Context Reset"
 
 # Warmup Ping (background)
 (
-    run_with_retry "warmup-ping" 120 2 \
-        "${WARMUP_CMD:-echo 'WARMUP_CMD not configured'}"
+    log "  → Warmup ping..."
+    if run_with_retry "warmup-ping" 120 2 \
+        "${WARMUP_CMD:-echo 'WARMUP_CMD not configured'}"; then
+        log "  ✅ Warmup complete"
+    else
+        log "  ⚠️ Warmup failed (non-critical)"
+    fi
 ) &
 WARMUP_PID=$!
 
 # Context Reset (foreground, fast)
 if [ -x "$SCRIPT_DIR/context-reset-stats.sh" ]; then
-    "$SCRIPT_DIR/context-reset-stats.sh" 2>&1 | tee -a "$LOG" || \
+    log "  → Context reset..."
+    if "$SCRIPT_DIR/context-reset-stats.sh" >> "$LOG" 2>&1; then
+        log "  ✅ Context reset done"
+    else
         log "  ⚠️ Context reset failed (non-critical)"
+    fi
 else
     log "  ⚠️ context-reset-stats.sh not found"
 fi
 
 # Wait for warmup
-if wait $WARMUP_PID; then
-    log "  ✅ Warmup complete"
-else
-    log "  ⚠️ Warmup failed, continuing anyway"
-fi
+wait $WARMUP_PID || true
+PHASE_RESULTS+=("phase0=ok")
 
 # ── Phase 1: Per-Agent Summaries (THE CORE) ──
 
@@ -118,9 +147,11 @@ log "📓 Phase 1: Per-Agent Summaries"
 AGENTS="${AGENT_LIST:-}"
 AGENT_NOTE_COUNT=0
 AGENT_SKIP_COUNT=0
+AGENT_FAIL_COUNT=0
 
 if [ -n "$AGENTS" ]; then
     PIDS=()
+    AGENT_NAMES=()
 
     for agent in $AGENTS; do
         (
@@ -143,8 +174,12 @@ if [ -n "$AGENTS" ]; then
             fi
 
             # Run agent-specific summary command
-            # AGENT_SUMMARY_CMD should use $agent variable
-            if eval "${AGENT_SUMMARY_CMD:-echo 'AGENT_SUMMARY_CMD not configured for $agent'}" 2>&1 | tee -a "$LOG"; then
+            # AGENT_SUMMARY_CMD should use $agent and $YESTERDAY variables.
+            # The prompt should explicitly tell the agent:
+            #   - Which agent's work to summarize ($agent)
+            #   - Where to find session data (sessions_list, session transcripts, MEMORY.md)
+            #   - That it may be running as a localbot variant with a different agent ID
+            if eval "${AGENT_SUMMARY_CMD:-echo 'AGENT_SUMMARY_CMD not configured for $agent'}" >> "$DEBUG_LOG" 2>&1; then
                 log "  ✅ $agent: note written"
                 exit 0
             else
@@ -153,29 +188,36 @@ if [ -n "$AGENTS" ]; then
             fi
         ) &
         PIDS+=($!)
+        AGENT_NAMES+=("$agent")
     done
 
     # Wait for all agent summaries
     for i in "${!PIDS[@]}"; do
-        agent_name=$(echo "$AGENTS" | tr ' ' '\n' | sed -n "$((i+1))p")
-        if wait "${PIDS[$i]}"; then
+        wait "${PIDS[$i]}" 2>/dev/null
+        exit_code=$?
+        if [ "$exit_code" -eq 0 ]; then
             AGENT_NOTE_COUNT=$((AGENT_NOTE_COUNT + 1))
+        elif [ "$exit_code" -eq 100 ]; then
+            AGENT_SKIP_COUNT=$((AGENT_SKIP_COUNT + 1))
         else
-            exit_code=$?
-            if [ "$exit_code" -eq 100 ]; then
-                AGENT_SKIP_COUNT=$((AGENT_SKIP_COUNT + 1))
-            fi
-            # Don't fail pipeline for individual agent failures
+            AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
+            log "  ⚠️ ${AGENT_NAMES[$i]} failed (pipeline continues)"
         fi
     done
 
-    log "  📊 Agent notes: ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped"
+    log "  📊 Results: ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped, ${AGENT_FAIL_COUNT} failed"
+    PHASE_RESULTS+=("phase1=${AGENT_NOTE_COUNT}ok/${AGENT_FAIL_COUNT}fail/${AGENT_SKIP_COUNT}skip")
 
     if [ "$AGENT_NOTE_COUNT" -gt 0 ] || [ "$AGENT_SKIP_COUNT" -gt 0 ]; then
         AGENT_NOTES_AVAILABLE=true
     fi
+
+    if [ "$AGENT_FAIL_COUNT" -gt 0 ]; then
+        set_degraded
+    fi
 else
     log "  ⚠️ AGENT_LIST empty, skipping per-agent summaries"
+    PHASE_RESULTS+=("phase1=skipped")
 fi
 
 # ── Phase 2: Daily Summary (aggregates agent notes) ──
@@ -184,16 +226,20 @@ log ""
 log "📝 Phase 2: Daily Summary"
 
 if [ "$AGENT_NOTES_AVAILABLE" = true ]; then
+    log "  → Creating daily summary..."
     if run_with_retry "daily-summary" 600 2 \
         "${SUMMARY_CMD:-echo 'SUMMARY_CMD not configured'}"; then
         log "  ✅ Daily summary complete"
+        PHASE_RESULTS+=("phase2=ok")
     else
         log "  ❌ Daily summary FAILED — briefing will use fallback"
-        STATUS="degraded"
+        set_degraded
+        PHASE_RESULTS+=("phase2=FAILED")
     fi
 else
     log "  ⚠️ No agent notes available, skipping summary"
-    STATUS="degraded"
+    set_degraded
+    PHASE_RESULTS+=("phase2=skipped")
 fi
 
 # ── Phase 3: Briefing + Memory Sync (parallel) ──
@@ -203,8 +249,14 @@ log "📬 Phase 3: Briefing + Memory Sync"
 
 # Morning Briefing (background)
 (
-    run_with_retry "morning-briefing" 300 2 \
-        "${BRIEFING_CMD:-echo 'BRIEFING_CMD not configured'}"
+    log "  → Briefing starting..."
+    if run_with_retry "morning-briefing" 600 2 \
+        "${BRIEFING_CMD:-echo 'BRIEFING_CMD not configured'}"; then
+        log "  ✅ Briefing complete"
+    else
+        log "  ❌ Briefing FAILED"
+        set_degraded
+    fi
 ) &
 BRIEFING_PID=$!
 
@@ -216,7 +268,7 @@ if [ -n "$AGENTS" ]; then
             if [ -n "$DRY_RUN" ]; then
                 log "    [DRY-RUN] Would sync: $agent"
             else
-                eval "${MEMORY_SYNC_CMD:-echo 'MEMORY_SYNC_CMD not configured for $agent'}" 2>&1 | tee -a "$LOG"
+                eval "${MEMORY_SYNC_CMD:-echo 'MEMORY_SYNC_CMD not configured for $agent'}" >> "$DEBUG_LOG" 2>&1 || true
             fi
         ) &
     done
@@ -225,22 +277,25 @@ if [ -n "$AGENTS" ]; then
 fi
 
 # Wait for briefing
-if wait $BRIEFING_PID; then
-    log "  ✅ Briefing complete"
+if wait $BRIEFING_PID 2>/dev/null; then
+    PHASE_RESULTS+=("phase3=ok")
 else
-    log "  ❌ Briefing FAILED"
-    STATUS="degraded"
+    set_degraded
+    PHASE_RESULTS+=("phase3=briefing-failed")
 fi
 
 # ── Phase 4: Status Report ──
 
+FINAL_STATUS=$(get_status)
+
 log ""
 log "📊 Phase 4: Status Report"
-log "  Status: $STATUS"
-log "  Duration: ${SECONDS}s"
-log "  Agent notes: ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped"
+log "  Status:       $FINAL_STATUS"
+log "  Duration:     ${SECONDS}s"
+log "  Agent notes:  ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped, ${AGENT_FAIL_COUNT} failed"
+log "  Phases:       ${PHASE_RESULTS[*]}"
 
-if [ "$STATUS" = "degraded" ]; then
+if [ "$FINAL_STATUS" = "degraded" ]; then
     log "  ⚠️ Pipeline completed with errors"
     if [ -n "${ALERT_CMD:-}" ] && [ -z "$DRY_RUN" ]; then
         bash -c "$ALERT_CMD" || true
@@ -253,5 +308,8 @@ log ""
 log "════════════════════════════════════════"
 log "💙 Pipeline End: $(date +%H:%M:%S) (${SECONDS}s)"
 log "════════════════════════════════════════"
+
+# Cleanup
+rm -f "$STATUS_FILE"
 
 exit 0
