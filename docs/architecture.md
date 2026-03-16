@@ -22,50 +22,48 @@ Phase 0: PARALLEL
 ├── Warmup Ping (60-90s) ─── Primes GPU inference
 └── Context Reset (5s) ──── Sends activity stats
 
-Phase 1: PARALLEL (per agent)                    ← THE CORE
-├── Agent A: read sessions → write own note
-├── Agent B: read sessions → write own note
-├── Agent C: read sessions → write own note
-└── ...
-    Each agent writes ONLY to: agents/<name>/memory/YYYY-MM-DD.md
-    Skips if entry for that date already exists.
+Phase 1: PARALLEL (per agent)              ← THE CORE
+├── Agent A: read sessions → write own daily note
+├── Agent B: read sessions → write own daily note
+├── Agent C: read sessions → write own daily note
+└── (skips if agent already has a note for that day)
 
 Phase 2: SEQUENTIAL
-└── Daily Summary ── Reads all agent notes, writes shared summary
-    Input:  agents/*/memory/YYYY-MM-DD.md
-    Output: workspace/memory/YYYY-MM-DD.md
+└── Daily Summary (2-5 min)
+    Reads all agents/*/memory/YYYY-MM-DD.md
+    Writes shared workspace/memory/YYYY-MM-DD.md
 
 Phase 3: PARALLEL
 ├── Morning Briefing (2-3 min) ── Reads shared summary
-└── Memory Sync (10s) ────────── Triggers index updates
+└── Memory Sync (10s) ────────── Triggers index update
 
 Phase 4: REPORT
 └── Status + Logging (instant)
 ```
 
-### The Core: Per-Agent Summaries
+### Data Ownership
 
-This is the heart of vergissmeinnicht. Each agent:
+**Critical principle:** Each agent owns its own memory.
 
-1. **Reads its own session history** since the last context reset
-2. **Checks** if `agents/<name>/memory/YYYY-MM-DD.md` already exists
-3. **If not:** Summarizes sessions into a daily note and writes it
-4. **If yes:** Skips (no duplication; agent may have written notes during the day)
+```
+agents/schreiber/memory/2026-03-14.md  ← only Schreiber's work
+agents/labmaster/memory/2026-03-14.md  ← only Labmaster's work
+agents/planning/memory/2026-03-14.md   ← only Planning's work
 
-**Key rules:**
-- Each agent writes ONLY its own notes
-- No cross-contamination (labmaster never gets schreiber content)
-- Existing entries are preserved (human or agent-written notes take priority)
-- Notes are each agent's personal memory — treat them as such
+workspace/memory/2026-03-14.md         ← aggregated overview (all agents)
+```
 
-### Why Agent Notes First, Summary Second?
+The pipeline NEVER copies shared content into agent-specific directories. Each agent's daily note contains only what that agent did.
 
-The per-agent notes are the **source of truth**. The shared daily summary merely aggregates them for overview purposes (briefings, cross-agent awareness). This ensures:
+### Per-Agent Summary (Phase 1)
 
-- Each agent's memory is coherent and relevant to its role
-- The shared summary can be regenerated from agent notes
-- Agents don't need to understand other agents' domains
-- `memory_search` per agent returns only relevant results
+For each agent:
+1. Read session history since last context reset
+2. Check if `agents/<agent>/memory/YYYY-MM-DD.md` already exists
+3. If no entry exists: summarize sessions and write the note
+4. If entry exists: skip (don't duplicate)
+
+This runs **in parallel** across all agents — with prefix caching, 6 agents at ~8K context each use only ~40% of KV cache.
 
 ### Error Handling
 
@@ -99,7 +97,7 @@ run_with_retry() {
 | Warmup | Agent notes run (just slower first request) |
 | Context Reset | Skip — non-critical |
 | Per-Agent Notes | Summary uses whatever notes exist |
-| Daily Summary | Briefing uses last 3 days instead |
+| Daily Summary | Briefing reads last 3 days instead |
 | Briefing | Alert only, retry tomorrow |
 | Memory Sync | Skip — agents auto-sync on next search |
 
@@ -114,12 +112,12 @@ run_with_retry() {
 00:05  Warmup + Context Reset (parallel)
 01:35  Warmup done
 01:35  Per-Agent Summaries start (parallel, all agents)
-04:00  Agent notes done (~2-3 min with parallelism)
-04:00  Daily Summary starts (aggregation)
-07:00  Summary done
-07:00  Briefing + Memory Sync (parallel)
-10:00  Both done
-10:05  Status report logged
+04:00  All agent notes written
+04:00  Daily Summary starts (reads agent notes)
+06:30  Summary done
+06:30  Briefing + Memory Sync (parallel)
+09:00  Both done
+09:05  Status report logged
 ```
 
 ### Budget: 15 Minutes
@@ -129,7 +127,7 @@ The pipeline is designed to fit within a 15-minute GPU window. If a job exceeds 
 ### Health Check (Independent)
 
 Runs 1 hour after pipeline (separate cron entry):
-- Checks agent notes exist for today
+- Checks agent notes exist
 - Checks shared summary file exists
 - Verifies pipeline log shows completion
 - Alerts on failures
@@ -137,21 +135,21 @@ Runs 1 hour after pipeline (separate cron entry):
 ## Data Flow
 
 ```
-Session Logs ──┐
-(per agent)    │
-               ▼
-          Per-Agent Notes ──▶ agents/<name>/memory/YYYY-MM-DD.md
-               │
-               ▼
-          Daily Summary ───▶ workspace/memory/YYYY-MM-DD.md
-               │
-               ▼
-Weather ──────────┐
-System Metrics ───┤    Morning Briefing ──▶ Team Channel
-Pending Tasks ────┤
-Cron Reminders ───┘
-
-Matrix API ──▶ Message Stats ──▶ Context Reset ──▶ Agent Channels
+Session History ──────────────────────────────────────┐
+(per agent, since last reset)                         │
+                                                      ▼
+                                              Per-Agent Notes
+                                              agents/*/memory/YYYY-MM-DD.md
+                                                      │
+                    ┌─────────────────────────────────┤
+                    ▼                                  ▼
+             Daily Summary                      Memory Sync
+             workspace/memory/YYYY-MM-DD.md     (update search indices)
+                    │
+        ┌───────────┤
+        ▼           ▼
+   Briefing    Context Reset
+   (planning)  (activity stats)
 ```
 
 ## Dependencies
