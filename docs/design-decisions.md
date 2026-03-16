@@ -177,6 +177,53 @@ Simple, greppable, readable.
 
 ## 10. Why "vergissmeinnicht"?
 
+## 11. Sacrifice Agent + Prefix Cache Exploitation
+
+**Decision:** Prime the LLM's prefix cache with a warmup request before launching parallel work.
+
+**Context:** vLLM (and similar engines) cache the KV states of system prompts. If multiple requests share the same system prompt prefix, only the first request pays the full prompt-processing (PP) cost. Subsequent requests reuse the cached prefix and only process the unique user-message tail.
+
+**What we tried:**
+- 6 different agent variants in parallel → 6 different system prompts → no cache sharing → 0-30% completion rate (PP overhead × 6 overwhelmed the GPU)
+- 1 agent variant × 6 parallel requests → 1 system prompt → prefix cached → **95-100% completion rate**
+
+**The pattern:**
+1. **"Sacrifice agent"** — Send a cheap warmup request to prime the prefix cache
+2. **Wait** — Prefix cache is now hot
+3. **Parallel burst** — Send N real requests sharing the cached prefix
+4. Only the per-request variable tail (agent name, date, paths) needs PP
+
+**Numbers (3× RTX 3060, 36GB, Qwen3.5-35B-A3B):**
+- Warmup: ~8-10 seconds
+- Per-note with warm cache: ~15-25 seconds
+- 42 notes (7 days × 6 agents): 69 seconds total (incl. skip checks)
+- Optimal parallelism: 6 concurrent (2 per GPU)
+
+**Why it matters:** This turns moderate hardware into a practical daily pipeline. Without prefix cache exploitation, the same hardware couldn't complete the pipeline within reasonable timeouts.
+
+---
+
+## 12. Pre-Inject Ground Truth over Trust-the-Model
+
+**Decision:** Extract relevant MEMORY.md excerpts and inject them directly into each prompt, rather than asking the model to read the file itself.
+
+**Problem:** When asked to "read MEMORY.md and check for activity on date X", the model would sometimes:
+- Claim the file doesn't exist (it does)
+- Skip the Read tool call entirely
+- Write "no activity" without investigating
+
+This happened consistently with a file that was 19KB and had an explicit section header matching the target date.
+
+**Solution:** The orchestrator script runs `grep -B2 -A20 "$date" MEMORY.md` and injects the excerpt directly into the prompt. The model receives the evidence as part of its input — it cannot claim the data doesn't exist when it's literally in the message.
+
+**Result:** Quality jumped from 0/10 to 10/10 for the critical test case.
+
+**Principle:** For batch/automated workflows, pre-compute what you can. Don't rely on multi-step tool-use chains when you can hand the model the answer as context. This is especially important for smaller models (7-35B) that are less reliable at complex tool orchestration.
+
+---
+
+## 13. Project Name
+
 *Vergissmeinnicht* (German: "forget-me-not" 💙) — the flower that symbolizes remembrance.
 
 The pipeline exists because AI agents forget. Every day, they wake up with no memory of yesterday unless someone writes it down. vergissmeinnicht is that someone.
