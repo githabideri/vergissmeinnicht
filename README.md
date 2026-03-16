@@ -62,7 +62,7 @@ vergissmeinnicht automates the daily routine for multi-agent AI setups: write pe
 - Parallel execution where safe (warmup + context reset, per-agent notes, briefing + memory sync)
 - Sequential where required (agent notes → summary → briefing)
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+See [docs/architecture.md](docs/architecture.md) for the full design and [docs/design-decisions.md](docs/design-decisions.md) for the reasoning behind each choice.
 
 ## Quick Start
 
