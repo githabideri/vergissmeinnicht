@@ -1,30 +1,31 @@
 #!/bin/bash
 # vergissmeinnicht — Morning Pipeline Orchestrator
 #
-# Single script that runs the complete daily pipeline:
-# Phase 0: Warmup + Context Reset (parallel)
-# Phase 1: Per-Agent Summaries (parallel per agent) ← THE CORE
-# Phase 2: Daily Summary (aggregates agent notes)
-# Phase 3: Briefing + Memory Sync (parallel)
-# Phase 4: Status Report
+# Single-Agent Prefix Cache architecture (see docs/design-decisions.md #11, #12):
+#   - ONE agent writes ALL per-agent summaries → system prompt cached once
+#   - "Sacrifice agent" warmup primes the prefix cache before parallel burst
+#   - MEMORY.md excerpts pre-injected into prompts → no hallucinated "no activity"
 #
-# Usage: ./morning-pipeline.sh [--dry-run]
-# Cron:  0 6 * * * /path/to/scripts/morning-pipeline.sh
+# Phases:
+#   0: Sacrifice Agent warmup + Context Reset (parallel)
+#   1: Per-Agent Summaries (parallel, all through SUMMARY_AGENT)
+#   2: Daily Summary (aggregates agent notes)
+#   3: Briefing + Memory Sync (parallel)
+#   4: Status Report
+#
+# Usage:  ./morning-pipeline.sh [--dry-run]
+# Cron:   0 6 * * * /path/to/morning-pipeline.sh
 
 set -uo pipefail
-# NOTE: We intentionally do NOT use set -e here.
-# The orchestrator handles failures gracefully per-phase,
-# not crashing on the first non-zero exit code.
-# See docs/design-decisions.md §5 (Graceful Degradation).
+# NOTE: No set -e. Orchestrator handles failures per-phase.
 
 # ──────────────────────────────────────────
-# Configuration
+# Configuration (load from config.env if present)
 # ──────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Load config
 if [ -f "$REPO_DIR/config.env" ]; then
     # shellcheck source=/dev/null
     . "$REPO_DIR/config.env"
@@ -32,226 +33,265 @@ fi
 
 DATE=$(date +%Y-%m-%d)
 YESTERDAY=$(date -d yesterday +%Y-%m-%d 2>/dev/null || date -v-1d +%Y-%m-%d)
+
+# Paths (override via config.env)
 LOG_DIR="${LOG_DIR:-$REPO_DIR/logs}"
+OC_DIR="${OC_DIR:-/opt/openclaw}"
+OC_CMD="node ${OC_DIR}/openclaw.mjs"
+WORKSPACE="${WORKSPACE:-$REPO_DIR}"
+AGENT_DIR="${AGENT_DIR:-$WORKSPACE/agents}"
+SUMMARY_DIR="${SUMMARY_DIR:-$WORKSPACE/summaries}"
 LOG="${LOG_DIR}/morning-pipeline-${DATE}.log"
 DEBUG_LOG="${LOG_DIR}/morning-pipeline-${DATE}-debug.log"
-AGENT_MEMORY_DIR="${AGENT_MEMORY_DIR:-$REPO_DIR/agents}"
-SUMMARY_DIR="${SUMMARY_DIR:-$REPO_DIR/summaries}"
+
+# Single-Agent strategy: ALL summaries through one agent (prefix cache)
+SUMMARY_AGENT="${SUMMARY_AGENT:-localbot-planning}"
+
+# Agent list (override via config.env)
+if [ -z "${AGENTS+x}" ]; then
+    AGENTS=(agent1 agent2 agent3)  # Replace with your agent names
+fi
+
+# Agent workspace paths — override for agents with special mounts
+# Example: AGENT_WORKSPACE[mox]="/path/to/mounted/lxc/mox"
+declare -A AGENT_WORKSPACE
+
+# Session transcripts path pattern
+OC_HOME="${OC_HOME:-$HOME/.openclaw}"
+
+# Timeouts
+WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-120}"
+AGENT_SUMMARY_TIMEOUT="${AGENT_SUMMARY_TIMEOUT:-300}"
+DAILY_SUMMARY_TIMEOUT="${DAILY_SUMMARY_TIMEOUT:-600}"
+BRIEFING_TIMEOUT="${BRIEFING_TIMEOUT:-600}"
+MEMORY_SYNC_TIMEOUT="${MEMORY_SYNC_TIMEOUT:-60}"
+
 DRY_RUN=""
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN="true"
 
-# Track pipeline status via temp file — NOT a bash variable.
-# Bash subshells (background processes) can't propagate variable changes
-# to the parent. Using a temp file ensures set_degraded() works from
-# any phase, even when running in a ( ) & background subshell.
-STATUS_FILE=$(mktemp)
-echo "ok" > "$STATUS_FILE"
-
-AGENT_NOTES_AVAILABLE=false
-PHASE_RESULTS=()
-
-# Ensure directories
-mkdir -p "$LOG_DIR"
-mkdir -p "$SUMMARY_DIR"
+mkdir -p "$LOG_DIR" "$SUMMARY_DIR"
 
 # ──────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────
 
-log() {
-    echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"
+log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
+
+agent_workspace() {
+    local agent="$1"
+    echo "${AGENT_WORKSPACE[$agent]:-${AGENT_DIR}/${agent}}"
 }
 
-set_degraded() {
-    echo "degraded" > "$STATUS_FILE"
+# Pre-inject MEMORY.md excerpt for a date (Design Decision #12)
+memory_excerpt() {
+    local agent="$1" date="$2"
+    local memory_md
+    memory_md="$(agent_workspace "$agent")/MEMORY.md"
+    [ -f "$memory_md" ] && grep -B2 -A20 "$date" "$memory_md" 2>/dev/null | head -60
 }
 
-get_status() {
-    cat "$STATUS_FILE"
+oc_agent() {
+    local agent="$1" message="$2" timeout_s="${3:-180}"
+    if [ -n "$DRY_RUN" ]; then
+        log "    [DRY-RUN] openclaw agent --agent $agent (timeout: ${timeout_s}s)"
+        return 0
+    fi
+    cd "$OC_DIR" && timeout "$timeout_s" $OC_CMD agent \
+        --agent "$agent" --message "$message" --timeout "$timeout_s" \
+        --json >> "$DEBUG_LOG" 2>&1
 }
 
-run_with_retry() {
-    local job_name="$1"
-    local timeout_s="$2"
-    local max_retries="${3:-2}"
-    local cmd="$4"
+# Status tracking (temp file for subshell propagation)
+STATUS_FILE=$(mktemp)
+echo "ok" > "$STATUS_FILE"
+set_degraded() { echo "degraded" > "$STATUS_FILE"; }
+get_status() { cat "$STATUS_FILE"; }
+PHASE_RESULTS=()
 
-    for attempt in $(seq 1 "$max_retries"); do
-        if [ -n "$DRY_RUN" ]; then
-            log "  [DRY-RUN] Would run: $job_name (timeout: ${timeout_s}s)"
-            return 0
-        fi
-
-        if timeout "$timeout_s" bash -c "$cmd" >> "$DEBUG_LOG" 2>&1; then
-            return 0
-        fi
-
-        if [ "$attempt" -lt "$max_retries" ]; then
-            log "  ⚠️ $job_name attempt $attempt/$max_retries failed, retrying in 10s..."
-            sleep 10
-        fi
-    done
-
-    log "  ❌ $job_name FAILED after $max_retries attempts"
-    return 1
-}
-
-# ──────────────────────────────────────────
-# Pipeline
 # ──────────────────────────────────────────
 
 log "════════════════════════════════════════"
 log "💙 vergissmeinnicht — Morning Pipeline"
 log "   Date: $DATE (yesterday: $YESTERDAY)"
+log "   Agent: $SUMMARY_AGENT (single-agent prefix cache)"
+log "   Targets: ${AGENTS[*]}"
 [ -n "$DRY_RUN" ] && log "   Mode: DRY-RUN"
 log "════════════════════════════════════════"
 
-# ── Phase 0: Warmup + Context Reset (parallel) ──
+# ══════════════════════════════════════════
+# Phase 0: Sacrifice Agent + Context Reset
+# ══════════════════════════════════════════
 
 log ""
-log "🔥 Phase 0: Warmup + Context Reset"
+log "🔥 Phase 0: Sacrifice Agent + Context Reset"
 
-# Warmup Ping (background)
 (
-    log "  → Warmup ping..."
-    if run_with_retry "warmup-ping" 120 2 \
-        "${WARMUP_CMD:-echo 'WARMUP_CMD not configured'}"; then
-        log "  ✅ Warmup complete"
+    log "  → Priming prefix cache via $SUMMARY_AGENT..."
+    if oc_agent "$SUMMARY_AGENT" "System check: list directories in ${AGENT_DIR}/" "$WARMUP_TIMEOUT"; then
+        log "  ✅ Prefix cache primed"
     else
         log "  ⚠️ Warmup failed (non-critical)"
     fi
 ) &
 WARMUP_PID=$!
 
-# Context Reset (foreground, fast)
+# Optional: context reset script
 if [ -x "$SCRIPT_DIR/context-reset-stats.sh" ]; then
     log "  → Context reset..."
-    if "$SCRIPT_DIR/context-reset-stats.sh" >> "$LOG" 2>&1; then
-        log "  ✅ Context reset done"
-    else
-        log "  ⚠️ Context reset failed (non-critical)"
-    fi
-else
-    log "  ⚠️ context-reset-stats.sh not found"
+    "$SCRIPT_DIR/context-reset-stats.sh" >> "$LOG" 2>&1 && log "  ✅ Context reset" || log "  ⚠️ Context reset failed"
 fi
 
-# Wait for warmup
 wait $WARMUP_PID || true
 PHASE_RESULTS+=("phase0=ok")
 
-# ── Phase 1: Per-Agent Summaries (THE CORE) ──
+# ══════════════════════════════════════════
+# Phase 1: Per-Agent Summaries (THE CORE)
+# ══════════════════════════════════════════
 
 log ""
-log "📓 Phase 1: Per-Agent Summaries"
+log "📓 Phase 1: Per-Agent Summaries (all via $SUMMARY_AGENT)"
 
-AGENTS="${AGENT_LIST:-}"
 AGENT_NOTE_COUNT=0
 AGENT_SKIP_COUNT=0
 AGENT_FAIL_COUNT=0
+AGENT_PIDS=()
+AGENT_NAMES=()
 
-if [ -n "$AGENTS" ]; then
-    PIDS=()
-    AGENT_NAMES=()
+# Shared prompt prefix — IDENTICAL for all → prefix cache gold
+SHARED_PREFIX='Write a daily memory note for an OpenClaw agent. Details follow at the end.
 
-    for agent in $AGENTS; do
-        (
-            NOTE_FILE="${AGENT_MEMORY_DIR}/${agent}/memory/${DATE}.md"
+## Investigation Checklist (MANDATORY)
+Use the Read tool on ALL paths below. Do NOT skip steps. Do NOT claim files do not exist without reading them.
 
-            # Skip if note already exists for today
-            if [ -f "$NOTE_FILE" ] && [ -s "$NOTE_FILE" ]; then
-                log "  ⏭️  $agent: note exists, skipping"
-                exit 100  # Special exit code: skipped
-            fi
+Step 1: Read the agent MEMORY.md (path below) — search for the target date
+Step 2: List and read files in the agent memory/ directory
+Step 3: List session transcripts: ls -la <sessions_path>/*.jsonl — check timestamps
 
-            # Ensure directory exists
-            mkdir -p "$(dirname "$NOTE_FILE")"
+## Output Rules
+- Save to the output path below (use Write tool)
+- Start with: # <DATE> Daily Note — <AGENT>
+- Use ## headers. Include specifics (files, errors, metrics).
+- Skip routine (heartbeats, NO_REPLY).
+- Active days: 100-500 words. Quiet days: 30-50 words.
+- NEVER claim "no MEMORY.md" without reading it. If PRE-LOADED excerpt exists, note MUST reflect it.
 
-            log "  → $agent: summarizing sessions..."
+---
+AGENT-SPECIFIC DETAILS:
+'
 
-            if [ -n "$DRY_RUN" ]; then
-                log "  [DRY-RUN] Would create: $NOTE_FILE"
-                exit 0
-            fi
+for agent in "${AGENTS[@]}"; do
+    AGENT_WS=$(agent_workspace "$agent")
+    NOTE_FILE="${AGENT_WS}/memory/${DATE}.md"
+    SESSIONS_DIR="${OC_HOME}/agents/${agent}/sessions"
 
-            # Run agent-specific summary command
-            # AGENT_SUMMARY_CMD should use $agent and $YESTERDAY variables.
-            # The prompt should explicitly tell the agent:
-            #   - Which agent's work to summarize ($agent)
-            #   - Where to find session data (sessions_list, session transcripts, MEMORY.md)
-            #   - That it may be running as a localbot variant with a different agent ID
-            if eval "${AGENT_SUMMARY_CMD:-echo 'AGENT_SUMMARY_CMD not configured for $agent'}" >> "$DEBUG_LOG" 2>&1; then
-                log "  ✅ $agent: note written"
-                exit 0
-            else
-                log "  ❌ $agent: summary failed"
-                exit 1
-            fi
-        ) &
-        PIDS+=($!)
-        AGENT_NAMES+=("$agent")
-    done
+    if [ -f "$NOTE_FILE" ] && [ -s "$NOTE_FILE" ]; then
+        log "  ⏭️  $agent ($(wc -c < "$NOTE_FILE")B)"
+        AGENT_SKIP_COUNT=$((AGENT_SKIP_COUNT + 1))
+        continue
+    fi
 
-    # Wait for all agent summaries
-    for i in "${!PIDS[@]}"; do
-        wait "${PIDS[$i]}" 2>/dev/null
-        exit_code=$?
-        if [ "$exit_code" -eq 0 ]; then
+    log "  → $agent"
+
+    TAIL="Agent: ${agent}
+Date: ${YESTERDAY}
+Paths:
+  MEMORY.md:        ${AGENT_WS}/MEMORY.md
+  Memory dir:       ${AGENT_WS}/memory/
+  Sessions:         ${SESSIONS_DIR}/
+  Output:           ${NOTE_FILE}"
+
+    EXCERPT=$(memory_excerpt "$agent" "$YESTERDAY")
+    if [ -n "$EXCERPT" ]; then
+        TAIL="${TAIL}
+
+=== PRE-LOADED MEMORY.md excerpt for ${YESTERDAY} ===
+(From ${AGENT_WS}/MEMORY.md — file EXISTS)
+${EXCERPT}
+=== END ===
+Your note MUST reflect this content."
+    fi
+
+    (
+        oc_agent "$SUMMARY_AGENT" "${SHARED_PREFIX}${TAIL}" "$AGENT_SUMMARY_TIMEOUT" || exit 1
+    ) &
+    AGENT_PIDS+=($!)
+    AGENT_NAMES+=("$agent")
+done
+
+for i in "${!AGENT_PIDS[@]}"; do
+    if wait "${AGENT_PIDS[$i]}" 2>/dev/null; then
+        NF="$(agent_workspace "${AGENT_NAMES[$i]}")/memory/${DATE}.md"
+        if [ -f "$NF" ] && [ -s "$NF" ]; then
             AGENT_NOTE_COUNT=$((AGENT_NOTE_COUNT + 1))
-        elif [ "$exit_code" -eq 100 ]; then
-            AGENT_SKIP_COUNT=$((AGENT_SKIP_COUNT + 1))
+            log "  ✅ ${AGENT_NAMES[$i]} ($(wc -c < "$NF")B)"
         else
             AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
-            log "  ⚠️ ${AGENT_NAMES[$i]} failed (pipeline continues)"
+            log "  ⚠️ ${AGENT_NAMES[$i]}: OK but no file"
         fi
-    done
-
-    log "  📊 Results: ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped, ${AGENT_FAIL_COUNT} failed"
-    PHASE_RESULTS+=("phase1=${AGENT_NOTE_COUNT}ok/${AGENT_FAIL_COUNT}fail/${AGENT_SKIP_COUNT}skip")
-
-    if [ "$AGENT_NOTE_COUNT" -gt 0 ] || [ "$AGENT_SKIP_COUNT" -gt 0 ]; then
-        AGENT_NOTES_AVAILABLE=true
+    else
+        AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
+        log "  ⚠️ ${AGENT_NAMES[$i]} failed"
     fi
+done
 
-    if [ "$AGENT_FAIL_COUNT" -gt 0 ]; then
-        set_degraded
-    fi
-else
-    log "  ⚠️ AGENT_LIST empty, skipping per-agent summaries"
-    PHASE_RESULTS+=("phase1=skipped")
-fi
+log "  📊 Results: ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped, ${AGENT_FAIL_COUNT} failed"
+PHASE_RESULTS+=("phase1=${AGENT_NOTE_COUNT}ok/${AGENT_FAIL_COUNT}fail/${AGENT_SKIP_COUNT}skip")
 
-# ── Phase 2: Daily Summary (aggregates agent notes) ──
+AGENT_NOTES_AVAILABLE=false
+[ "$AGENT_NOTE_COUNT" -gt 0 ] || [ "$AGENT_SKIP_COUNT" -gt 0 ] && AGENT_NOTES_AVAILABLE=true
+[ "$AGENT_FAIL_COUNT" -gt 0 ] && set_degraded
+
+# ══════════════════════════════════════════
+# Phase 2: Daily Summary
+# ══════════════════════════════════════════
 
 log ""
 log "📝 Phase 2: Daily Summary"
 
 if [ "$AGENT_NOTES_AVAILABLE" = true ]; then
-    log "  → Creating daily summary..."
-    if run_with_retry "daily-summary" 600 2 \
-        "${SUMMARY_CMD:-echo 'SUMMARY_CMD not configured'}"; then
-        log "  ✅ Daily summary complete"
+    log "  → Creating summary (via $SUMMARY_AGENT)..."
+    SUMMARY_PROMPT="Create the shared daily summary for ${YESTERDAY}.
+Read per-agent notes from: agents/*/memory/${DATE}.md
+Aggregate into: summaries/${DATE}.md
+
+Format:
+# ${DATE} Daily Memory
+## New Today  [grouped by topic]
+## Decisions & Outcomes
+## Open Items  [3+ day items get (since MM-DD)]
+
+Rules: Read previous summary for dedup. 200-400 words max."
+
+    if oc_agent "$SUMMARY_AGENT" "$SUMMARY_PROMPT" "$DAILY_SUMMARY_TIMEOUT"; then
+        log "  ✅ Summary complete"
         PHASE_RESULTS+=("phase2=ok")
     else
-        log "  ❌ Daily summary FAILED — briefing will use fallback"
+        log "  ❌ Summary FAILED"
         set_degraded
         PHASE_RESULTS+=("phase2=FAILED")
     fi
 else
-    log "  ⚠️ No agent notes available, skipping summary"
+    log "  ⚠️ No notes available, skipping"
     set_degraded
     PHASE_RESULTS+=("phase2=skipped")
 fi
 
-# ── Phase 3: Briefing + Memory Sync (parallel) ──
+# ══════════════════════════════════════════
+# Phase 3: Briefing + Memory Sync
+# ══════════════════════════════════════════
 
 log ""
 log "📬 Phase 3: Briefing + Memory Sync"
 
-# Morning Briefing (background)
 (
-    log "  → Briefing starting..."
-    if run_with_retry "morning-briefing" 600 2 \
-        "${BRIEFING_CMD:-echo 'BRIEFING_CMD not configured'}"; then
+    log "  → Briefing..."
+    BRIEFING_PROMPT="Morning briefing for ${DATE}.
+Sources: summaries/${DATE}.md, agent notes, weather (if available).
+Section 1: Your Day (highlights, pending)
+Section 2: System Health
+Keep under 300 words. Archive to: summaries/briefings/${DATE}.md"
+
+    if oc_agent "$SUMMARY_AGENT" "$BRIEFING_PROMPT" "$BRIEFING_TIMEOUT"; then
         log "  ✅ Briefing complete"
     else
         log "  ❌ Briefing FAILED"
@@ -260,56 +300,36 @@ log "📬 Phase 3: Briefing + Memory Sync"
 ) &
 BRIEFING_PID=$!
 
-# Memory Sync (parallel per agent — trigger index updates)
-if [ -n "$AGENTS" ]; then
-    log "  → Memory sync starting..."
-    for agent in $AGENTS; do
-        (
-            if [ -n "$DRY_RUN" ]; then
-                log "    [DRY-RUN] Would sync: $agent"
-            else
-                eval "${MEMORY_SYNC_CMD:-echo 'MEMORY_SYNC_CMD not configured for $agent'}" >> "$DEBUG_LOG" 2>&1 || true
-            fi
-        ) &
-    done
-    wait
-    log "  ✅ Memory sync complete"
-fi
+log "  → Memory sync..."
+SYNC_PIDS=()
+for agent in "${AGENTS[@]}"; do
+    ( oc_agent "$SUMMARY_AGENT" "Run memory_search for '${agent} daily sync ${DATE}'." "$MEMORY_SYNC_TIMEOUT" || true ) &
+    SYNC_PIDS+=($!)
+done
+for pid in "${SYNC_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+log "  ✅ Memory sync done"
 
-# Wait for briefing
-if wait $BRIEFING_PID 2>/dev/null; then
-    PHASE_RESULTS+=("phase3=ok")
-else
-    set_degraded
-    PHASE_RESULTS+=("phase3=briefing-failed")
-fi
+wait $BRIEFING_PID 2>/dev/null && PHASE_RESULTS+=("phase3=ok") || { set_degraded; PHASE_RESULTS+=("phase3=briefing-failed"); }
 
-# ── Phase 4: Status Report ──
+# ══════════════════════════════════════════
+# Phase 4: Status Report
+# ══════════════════════════════════════════
 
 FINAL_STATUS=$(get_status)
 
 log ""
 log "📊 Phase 4: Status Report"
-log "  Status:       $FINAL_STATUS"
-log "  Duration:     ${SECONDS}s"
-log "  Agent notes:  ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped, ${AGENT_FAIL_COUNT} failed"
-log "  Phases:       ${PHASE_RESULTS[*]}"
+log "  Status:  $FINAL_STATUS"
+log "  Duration: ${SECONDS}s"
+log "  Notes:   ${AGENT_NOTE_COUNT} written, ${AGENT_SKIP_COUNT} skipped, ${AGENT_FAIL_COUNT} failed"
+log "  Phases:  ${PHASE_RESULTS[*]}"
 
-if [ "$FINAL_STATUS" = "degraded" ]; then
-    log "  ⚠️ Pipeline completed with errors"
-    if [ -n "${ALERT_CMD:-}" ] && [ -z "$DRY_RUN" ]; then
-        bash -c "$ALERT_CMD" || true
-    fi
-else
-    log "  ✅ Pipeline completed successfully"
-fi
+[ "$FINAL_STATUS" = "degraded" ] && log "  ⚠️ Completed with errors" || log "  ✅ All phases OK"
 
 log ""
 log "════════════════════════════════════════"
 log "💙 Pipeline End: $(date +%H:%M:%S) (${SECONDS}s)"
 log "════════════════════════════════════════"
 
-# Cleanup
 rm -f "$STATUS_FILE"
-
 exit 0
