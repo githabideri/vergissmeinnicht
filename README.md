@@ -2,7 +2,7 @@
 
 **A morning pipeline for AI agent teams — so nothing gets forgotten.**
 
-vergissmeinnicht automates the daily routine for multi-agent AI setups: warm up GPU inference, summarize yesterday's work, send briefings, sync memory indices, and post activity stats to your team channels.
+vergissmeinnicht automates the daily routine for multi-agent AI setups: write per-agent daily notes from session history, aggregate them into a shared summary, warm up GPU inference, send briefings, sync memory indices, and post activity stats to your team channels.
 
 ## What It Does
 
@@ -18,8 +18,15 @@ vergissmeinnicht automates the daily routine for multi-agent AI setups: warm up 
     │                │
     └───────┬────────┘
             ▼
+   Per-Agent Summaries          ← THE CORE
+   (each agent summarizes
+    own sessions → own
+    memory/YYYY-MM-DD.md)
+            │
+            ▼
       Daily Summary
-      (yesterday → markdown)
+      (aggregates all agent
+       notes → shared note)
             │
     ┌───────┴────────┐
     │                │
@@ -32,12 +39,13 @@ vergissmeinnicht automates the daily routine for multi-agent AI setups: warm up 
       Status Report ✅
 ```
 
-**Total runtime:** ~12 minutes on consumer GPUs
+**Total runtime:** ~15 minutes on consumer GPUs
 
 ## Features
 
+- 📓 **Per-Agent Notes** — Each agent summarizes its own sessions into `agents/<name>/memory/YYYY-MM-DD.md` (the core feature — this is each agent's memory)
+- 📝 **Daily Summary** — Aggregates all per-agent notes into a single shared daily note
 - 🔥 **GPU Warmup** — Pre-compiles CUDAGraph and primes prefix cache before real work
-- 📝 **Daily Summary** — Aggregates all agent activity into a single daily note
 - 🌅 **Context Reset** — Posts activity stats to channels (message counts, token estimates)
 - 📬 **Morning Briefing** — Generates a daily briefing with weather, system health, pending tasks
 - 🧠 **Memory Sync** — Updates memory search indices for all agents in parallel
@@ -51,8 +59,8 @@ vergissmeinnicht automates the daily routine for multi-agent AI setups: warm up 
 - No complex cron job chaining
 - No job dependencies to manage
 - Inline retries with configurable timeouts
-- Parallel execution where safe (warmup + context reset, briefing + memory sync)
-- Sequential where required (summary must finish before briefing)
+- Parallel execution where safe (warmup + context reset, per-agent notes, briefing + memory sync)
+- Sequential where required (agent notes → summary → briefing)
 
 See [docs/architecture.md](docs/architecture.md) for the full design.
 
@@ -69,7 +77,7 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USER/vergissmeinnicht.git
+git clone https://github.com/githabideri/vergissmeinnicht.git
 cd vergissmeinnicht
 
 # Copy example config
@@ -110,15 +118,35 @@ AGENT_LIST="agent1 agent2 agent3"
 # Paths
 LOG_DIR="/var/log/vergissmeinnicht"
 SUMMARY_DIR="/path/to/daily-summaries"
+AGENT_MEMORY_DIR="/path/to/agents"
 ```
 
 ## Scripts
 
 | Script | Purpose | Duration |
 |--------|---------|----------|
-| `morning-pipeline.sh` | Main orchestrator | ~12 min |
+| `morning-pipeline.sh` | Main orchestrator | ~15 min |
 | `context-reset-stats.sh` | Activity stats to Matrix | ~5s |
 | `pipeline-healthcheck.sh` | Verify completion | ~2s |
+
+## Data Flow
+
+```
+Agent Sessions (since last reset)
+    │
+    ▼ (per agent, parallel)
+agents/schreiber/memory/YYYY-MM-DD.md    ← agent's own memory
+agents/labmaster/memory/YYYY-MM-DD.md    ← agent's own memory
+agents/planning/memory/YYYY-MM-DD.md     ← agent's own memory
+    │
+    ▼ (aggregate)
+workspace/memory/YYYY-MM-DD.md           ← shared overview
+    │
+    ▼ (read)
+Morning Briefing → Team Channel
+```
+
+Each agent only gets its own notes. The shared summary aggregates across all agents but lives separately.
 
 ## GPU Concurrency Notes
 
@@ -126,8 +154,8 @@ Tested with **3× RTX 3060 12GB** (36 GB VRAM) running Qwen3.5-35B-A3B:
 
 | Scenario | Concurrent Sessions | KV Cache Usage |
 |----------|-------------------|----------------|
-| Single summary (16K ctx) | 1 | ~18% |
-| Summary + Briefing (46K total) | 2 | ~52% |
+| Per-agent notes (6 agents parallel) | 6 | ~40% |
+| Summary + Briefing | 2 | ~52% |
 | Memory sync (all agents) | 6-8 | trivial |
 | Backlog batch (10-15 parallel) | 10-15 | ~60-80% |
 
