@@ -20,20 +20,21 @@ vergissmeinnicht automates the daily routine for multi-agent AI setups: write pe
             ▼
    Per-Agent Summaries          ← THE CORE
    (each agent summarizes
-    own sessions → own
-    memory/YYYY-MM-DD.md)
+    the completed prior day
+    → agents/<name>/memory/TARGET_DATE.md)
             │
             ▼
       Daily Summary
       (aggregates all agent
-       notes → shared note)
+       notes → memory/TARGET_DATE.md)
             │
     ┌───────┴────────┐
     │                │
     ▼                ▼
   Morning        Memory
   Briefing       Sync
-  (team channel)  (all agents)
+  (archived as    (all agents)
+   briefing/DATE.md)
             │
             ▼
       Status Report ✅
@@ -43,8 +44,8 @@ vergissmeinnicht automates the daily routine for multi-agent AI setups: write pe
 
 ## Features
 
-- 📓 **Per-Agent Notes** — Each agent summarizes its own sessions into `agents/<name>/memory/YYYY-MM-DD.md` (the core feature — this is each agent's memory)
-- 📝 **Daily Summary** — Aggregates all per-agent notes into a single shared daily note
+- 📓 **Per-Agent Notes** — Each agent creates or updates the note for the completed prior day at `agents/<name>/memory/TARGET_DATE.md`
+- 📝 **Daily Summary** — Aggregates all per-agent notes into a shared note for that same `TARGET_DATE`
 - 🔥 **GPU Warmup** — Pre-compiles CUDAGraph and primes prefix cache before real work
 - 🌅 **Context Reset** — Posts activity stats to channels (message counts, token estimates)
 - 📬 **Morning Briefing** — Generates a daily briefing with weather, system health, pending tasks
@@ -104,21 +105,22 @@ Copy `examples/config.env.example` and fill in your values:
 
 ```bash
 # GPU Inference
-INFERENCE_URL="http://localhost:8000"
-INFERENCE_MODEL="your-model-name"
+VLLM_URL="http://localhost:8000"
+VLLM_MODEL="your-model-name"
 
 # Matrix Notifications
 MATRIX_HOMESERVER="https://matrix.example.com"
 MATRIX_TOKEN="your-access-token"
-MATRIX_ROOMS="!room1:server|name1,!room2:server|name2"
+MATRIX_ROOMS=("!room1:server|name1" "!room2:server|name2")
 
 # Agents
-AGENT_LIST="agent1 agent2 agent3"
+AGENTS=(agent1 agent2 agent3)
 
 # Paths
-LOG_DIR="/var/log/vergissmeinnicht"
-SUMMARY_DIR="/path/to/daily-summaries"
-AGENT_MEMORY_DIR="/path/to/agents"
+WORKSPACE="/path/to/workspace"
+AGENT_DIR="${WORKSPACE}/agents"
+SUMMARY_DIR="${WORKSPACE}/memory"
+BRIEFING_DIR="${SUMMARY_DIR}/briefings"
 ```
 
 ## Scripts
@@ -132,18 +134,19 @@ AGENT_MEMORY_DIR="/path/to/agents"
 ## Data Flow
 
 ```
-Agent Sessions (since last reset)
+Agent Sessions (for completed prior day = TARGET_DATE)
     │
     ▼ (per agent, parallel)
-agents/schreiber/memory/YYYY-MM-DD.md    ← agent's own memory
-agents/labmaster/memory/YYYY-MM-DD.md    ← agent's own memory
-agents/planning/memory/YYYY-MM-DD.md     ← agent's own memory
+agents/schreiber/memory/TARGET_DATE.md    ← agent's own memory
+agents/labmaster/memory/TARGET_DATE.md    ← agent's own memory
+agents/planning/memory/TARGET_DATE.md     ← agent's own memory
     │
     ▼ (aggregate)
-workspace/memory/YYYY-MM-DD.md           ← shared overview
+workspace/memory/TARGET_DATE.md           ← shared overview for that completed day
     │
-    ▼ (read)
+    ▼ (read on DATE=today)
 Morning Briefing → Team Channel
+archive: workspace/memory/briefings/DATE.md
 ```
 
 Each agent only gets its own notes. The shared summary aggregates across all agents but lives separately.
