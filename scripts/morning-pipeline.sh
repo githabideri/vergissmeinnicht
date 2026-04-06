@@ -56,9 +56,12 @@ OC_HOME="${OC_HOME:-$HOME/.openclaw}"
 # OC CLI helper — all OC commands go through this
 OC_CMD="node ${OC_DIR}/openclaw.mjs"
 
-# vLLM configuration (informational logging only)
-VLLM_URL="${VLLM_URL:-unset}"
-VLLM_MODEL="${VLLM_MODEL:-unset}"
+# vLLM or llama.cpp configuration (generic - works for both)
+INFERENCE_URL="${INFERENCE_URL:-unset}"
+INFERENCE_MODEL="${INFERENCE_MODEL:-unset}"
+
+# Backend type detection (vllm or llama-cpp)
+INFERENCE_BACKEND="${INFERENCE_BACKEND:-auto}"
 
 # Single-Agent Prefix Cache Strategy
 SUMMARY_AGENT="${SUMMARY_AGENT:-localbot-planning}"
@@ -90,6 +93,11 @@ MEMORY_SYNC_TIMEOUT="${MEMORY_SYNC_TIMEOUT:-60}"
 # Optional alert command (shell snippet, defined in config.env)
 ALERT_CMD="${ALERT_CMD:-}"
 
+# Logging / trace controls
+DEBUG_MODE="${DEBUG_MODE:-1}"
+AGENT_SUMMARY_RETRIES="${AGENT_SUMMARY_RETRIES:-1}"
+FILE_SETTLE_TIMEOUT_S="${FILE_SETTLE_TIMEOUT_S:-20}"
+
 DRY_RUN=""
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN="true"
 
@@ -101,6 +109,12 @@ mkdir -p "$LOG_DIR" "$SUMMARY_DIR" "$BRIEFING_DIR"
 
 printf 'ts_epoch\tts_iso\tkind\tname\tstatus\tduration_s\tnote\n' > "$TASKS_LOG"
 printf 'ts_epoch\tts_iso\tphase\tstatus\tduration_s\tnote\n' > "$PHASES_LOG"
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+TRACE_DIR="${LOG_DIR}/morning-pipeline-${DATE}-trace-${RUN_ID}"
+MANIFEST_LOG="${TRACE_DIR}/manifest.jsonl"
+mkdir -p "$TRACE_DIR"
+: > "$MANIFEST_LOG"
 
 # ──────────────────────────────────────────
 # Helpers
@@ -161,24 +175,86 @@ header_ok() {
     local file="$1"
     local expected_date="$2"
     [ -f "$file" ] || return 1
-    head -n 1 "$file" | grep -q "# ${expected_date}"
+    head -n 1 "$file" | grep -q "^# ${expected_date}"
+}
+
+json_escape() {
+    local str="$1"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    str="${str//$'\n'/\\n}"
+    str="${str//$'\r'/\\r}"
+    str="${str//$'\t'/\\t}"
+    printf '%s' "$str"
+}
+
+trace_event() {
+    local kind="$1"
+    local name="$2"
+    local status="$3"
+    local note="${4:-}"
+    printf '{"ts":"%s","kind":"%s","name":"%s","status":"%s","note":"%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_escape "$kind")" "$(json_escape "$name")" "$(json_escape "$status")" "$(json_escape "$note")" >> "$MANIFEST_LOG"
+}
+
+wait_for_file_settle() {
+    local file="$1"
+    local timeout_s="${2:-20}"
+    local elapsed=0
+    local stable_count=0
+    local last_size=-1
+
+    while [ "$elapsed" -lt "$timeout_s" ]; do
+        local size=0
+        [ -f "$file" ] && size=$(wc -c < "$file" 2>/dev/null || echo 0)
+
+        if [ "$size" -gt 0 ] && [ "$size" -eq "$last_size" ]; then
+            stable_count=$((stable_count + 1))
+            if [ "$stable_count" -ge 2 ]; then
+                return 0
+            fi
+        else
+            stable_count=0
+        fi
+
+        last_size="$size"
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
 }
 
 oc_agent() {
     local agent="$1"
     local message="$2"
     local timeout_s="${3:-180}"
+    local trace_file="${4:-}"
 
     if [ -n "$DRY_RUN" ]; then
         log "    [DRY-RUN] openclaw agent --agent $agent (timeout: ${timeout_s}s)"
+        [ -n "$trace_file" ] && printf '{"dryRun":true,"agent":"%s"}\n' "$agent" > "$trace_file"
         return 0
     fi
 
-    cd "$OC_DIR" && timeout "$timeout_s" $OC_CMD agent \
+    local tmp_out
+    tmp_out=$(mktemp)
+    local rc=0
+
+    if ! (cd "$OC_DIR" && timeout "$timeout_s" $OC_CMD agent \
         --agent "$agent" \
         --message "$message" \
         --timeout "$timeout_s" \
-        --json >> "$DEBUG_LOG" 2>&1
+        --json > "$tmp_out" 2>&1); then
+        rc=$?
+    fi
+
+    cat "$tmp_out" >> "$DEBUG_LOG"
+    if [ -n "$trace_file" ] && [ "$DEBUG_MODE" = "1" ]; then
+        cat "$tmp_out" > "$trace_file"
+    fi
+    rm -f "$tmp_out"
+    return "$rc"
 }
 
 STATUS_FILE=$(mktemp)
@@ -198,10 +274,40 @@ log "   Target date:   $TARGET_DATE"
 log "   Previous day:  $PREVIOUS_TARGET_DATE"
 log "   Agents:        ${AGENTS[*]}"
 log "   Summary agent: $SUMMARY_AGENT"
-log "   vLLM:          $VLLM_URL ($VLLM_MODEL)"
+
+# Auto-detect backend if INFERENCE_BACKEND=auto
+if [ "$INFERENCE_BACKEND" = "auto" ]; then
+    # Try vLLM first (preferred), fallback to llama.cpp
+    if curl -s --connect-timeout 2 "$INFERENCE_URL/v1/models" >/dev/null 2>&1; then
+        # Check if it's vLLM or llama.cpp
+        if curl -s "$INFERENCE_URL/v1/models" | grep -q "GPTQ\|vLLM"; then
+            INFERENCE_BACKEND="vllm"
+        else
+            INFERENCE_BACKEND="llama-cpp"
+        fi
+    else
+        log "  ⚠️ INFERENCE_URL unreachable, checking defaults..."
+        if curl -s --connect-timeout 2 "http://192.168.0.24:8000/v1/models" >/dev/null 2>&1; then
+            INFERENCE_BACKEND="vllm"
+            INFERENCE_URL="http://192.168.0.24:8000"
+        elif curl -s --connect-timeout 2 "http://192.168.0.27:8081/v1/models" >/dev/null 2>&1; then
+            INFERENCE_BACKEND="llama-cpp"
+            INFERENCE_URL="http://192.168.0.27:8081"
+        else
+            log "  ❌ No inference backend available!"
+            exit 1
+        fi
+    fi
+fi
+
+log "   Inference:     $INFERENCE_BACKEND ($INFERENCE_URL)"
 log "   Batch size:    $SUMMARY_BATCH_SIZE"
+log "   Run ID:        $RUN_ID"
+log "   Trace dir:     $TRACE_DIR"
 [ -n "$DRY_RUN" ] && log "   Mode:          DRY-RUN"
 log "════════════════════════════════════════"
+
+trace_event "run" "pipeline" "start" "date=${DATE};target=${TARGET_DATE};agent=${SUMMARY_AGENT};batch=${SUMMARY_BATCH_SIZE};debug=${DEBUG_MODE}"
 
 # ══════════════════════════════════════════
 # Phase 0: Warmup + Context Reset
@@ -225,14 +331,20 @@ PHASE0_START=$(now_epoch)
 WARMUP_PID=$!
 
 if [ -x "$SCRIPT_DIR/context-reset-stats.sh" ]; then
-    log "  → Context reset..."
-    _ctx_start=$(now_epoch)
-    if "$SCRIPT_DIR/context-reset-stats.sh" >> "$LOG" 2>&1; then
-        log "  ✅ Context reset done"
-        record_task "phase0" "context-reset" "ok" "$(( $(now_epoch) - _ctx_start ))"
+    if [ -n "$DRY_RUN" ]; then
+        log "  ⏭️ Context reset skipped in DRY-RUN (prevents room posts)"
+        record_task "phase0" "context-reset" "skipped-dry-run" "0"
     else
-        log "  ⚠️ Context reset failed (non-critical)"
-        record_task "phase0" "context-reset" "failed" "$(( $(now_epoch) - _ctx_start ))"
+        log "  → Context reset..."
+        _ctx_start=$(now_epoch)
+        if "$SCRIPT_DIR/context-reset-stats.sh" >> "$LOG" 2>&1; then
+            log "  ✅ Context reset done"
+            record_task "phase0" "context-reset" "ok" "$(( $(now_epoch) - _ctx_start ))"
+            sync  # Force sync after context reset
+        else
+            log "  ⚠️ Context reset failed (non-critical)"
+            record_task "phase0" "context-reset" "failed" "$(( $(now_epoch) - _ctx_start ))"
+        fi
     fi
 else
     log "  ⏭️ Context reset skipped (missing script)"
@@ -254,13 +366,6 @@ AGENT_CREATE_COUNT=0
 AGENT_UPDATE_COUNT=0
 AGENT_UNCHANGED_COUNT=0
 AGENT_FAIL_COUNT=0
-AGENT_PIDS=()
-AGENT_NAMES=()
-AGENT_MODES=()
-AGENT_STARTS=()
-AGENT_TARGETS=()
-AGENT_BEFORE_SHA=()
-AGENT_SESSION_COUNTS=()
 
 SHARED_PROMPT_PREFIX='Write or update a per-agent daily memory note for an OpenClaw agent. Agent-specific details follow at the end.
 
@@ -305,8 +410,6 @@ for agent in "${AGENTS[@]}"; do
     BEFORE_SHA=$(file_sha "$TARGET_FILE")
     SESSION_COUNT=$(session_file_count "$SESSIONS_DIR")
 
-    log "  → $agent (${MODE}; target=${TARGET_DATE}; sessions=${SESSION_COUNT}; file=${TARGET_FILE})"
-
     AGENT_TAIL="Agent: ${agent}
 Target date: ${TARGET_DATE}
 Mode: ${MODE}
@@ -334,113 +437,75 @@ ${EXCERPT}
 IMPORTANT: The above PROVES this agent had activity on ${TARGET_DATE}. Your note MUST reflect it."
     fi
 
-    (
-        if oc_agent "$SUMMARY_AGENT" "${SHARED_PROMPT_PREFIX}${AGENT_TAIL}" "$AGENT_SUMMARY_TIMEOUT"; then
-            exit 0
-        else
-            exit 1
-        fi
-    ) &
+    PROMPT="${SHARED_PROMPT_PREFIX}${AGENT_TAIL}"
+    PROMPT_SHA=$(printf '%s' "$PROMPT" | sha256sum | awk '{print $1}')
 
-    AGENT_PIDS+=($!)
-    AGENT_NAMES+=("$agent")
-    AGENT_MODES+=("$MODE")
-    AGENT_STARTS+=("$(now_epoch)")
-    AGENT_TARGETS+=("$TARGET_FILE")
-    AGENT_BEFORE_SHA+=("$BEFORE_SHA")
-    AGENT_SESSION_COUNTS+=("$SESSION_COUNT")
+    attempt=1
+    success=0
+    while [ "$attempt" -le $((AGENT_SUMMARY_RETRIES + 1)) ]; do
+        ATTEMPT_START=$(now_epoch)
+        TRACE_FILE="${TRACE_DIR}/phase1-${agent}-attempt${attempt}.json"
 
-    if [ "${#AGENT_PIDS[@]}" -ge "$SUMMARY_BATCH_SIZE" ]; then
-        for i in "${!AGENT_PIDS[@]}"; do
-            DURATION="$(( $(now_epoch) - ${AGENT_STARTS[$i]} ))"
-            TARGET_FILE="${AGENT_TARGETS[$i]}"
+        log "  → ${agent} (${MODE}; attempt ${attempt}/$((AGENT_SUMMARY_RETRIES + 1)); target=${TARGET_DATE}; sessions=${SESSION_COUNT})"
+        trace_event "phase1" "$agent" "start" "attempt=${attempt};mode=${MODE};target=${TARGET_DATE};prompt_sha=${PROMPT_SHA};trace=$(basename "$TRACE_FILE")"
+
+        if oc_agent "$SUMMARY_AGENT" "$PROMPT" "$AGENT_SUMMARY_TIMEOUT" "$TRACE_FILE"; then
+            sync
+            wait_for_file_settle "$TARGET_FILE" "$FILE_SETTLE_TIMEOUT_S" || true
+
             AFTER_SHA=$(file_sha "$TARGET_FILE")
             SIZE=0
             [ -f "$TARGET_FILE" ] && SIZE=$(wc -c < "$TARGET_FILE")
             HEADER_STATUS="bad-header"
             header_ok "$TARGET_FILE" "$TARGET_DATE" && HEADER_STATUS="ok"
+            DURATION="$(( $(now_epoch) - ATTEMPT_START ))"
 
-            if wait "${AGENT_PIDS[$i]}" 2>/dev/null; then
-                if [ -f "$TARGET_FILE" ] && [ -s "$TARGET_FILE" ]; then
-                    if [ "${AGENT_BEFORE_SHA[$i]}" = "missing" ]; then
-                        AGENT_CREATE_COUNT=$((AGENT_CREATE_COUNT + 1))
-                        log "  ✅ ${AGENT_NAMES[$i]} created (${SIZE}B; header=${HEADER_STATUS})"
-                        record_task "summary" "${AGENT_NAMES[$i]}" "created" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};size=${SIZE};header=${HEADER_STATUS}"
-                    elif [ "${AGENT_BEFORE_SHA[$i]}" = "$AFTER_SHA" ]; then
-                        AGENT_UNCHANGED_COUNT=$((AGENT_UNCHANGED_COUNT + 1))
-                        log "  ✅ ${AGENT_NAMES[$i]} unchanged (${SIZE}B; header=${HEADER_STATUS})"
-                        record_task "summary" "${AGENT_NAMES[$i]}" "unchanged" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};size=${SIZE};header=${HEADER_STATUS}"
-                    else
-                        AGENT_UPDATE_COUNT=$((AGENT_UPDATE_COUNT + 1))
-                        log "  ✅ ${AGENT_NAMES[$i]} updated (${SIZE}B; header=${HEADER_STATUS})"
-                        record_task "summary" "${AGENT_NAMES[$i]}" "updated" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};size=${SIZE};header=${HEADER_STATUS}"
-                    fi
-                    if [ "$HEADER_STATUS" != "ok" ]; then
-                        set_degraded
-                    fi
-                else
-                    AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
-                    log "  ⚠️ ${AGENT_NAMES[$i]}: agent returned OK but no file written"
-                    record_task "summary" "${AGENT_NAMES[$i]}" "no-file" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]}"
-                fi
-            else
-                AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
-                log "  ❌ ${AGENT_NAMES[$i]} failed"
-                record_task "summary" "${AGENT_NAMES[$i]}" "failed" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};mode=${AGENT_MODES[$i]}"
-            fi
-        done
-        AGENT_PIDS=()
-        AGENT_NAMES=()
-        AGENT_MODES=()
-        AGENT_STARTS=()
-        AGENT_TARGETS=()
-        AGENT_BEFORE_SHA=()
-        AGENT_SESSION_COUNTS=()
-    fi
-done
-
-for i in "${!AGENT_PIDS[@]}"; do
-    DURATION="$(( $(now_epoch) - ${AGENT_STARTS[$i]} ))"
-    TARGET_FILE="${AGENT_TARGETS[$i]}"
-    AFTER_SHA=$(file_sha "$TARGET_FILE")
-    SIZE=0
-    [ -f "$TARGET_FILE" ] && SIZE=$(wc -c < "$TARGET_FILE")
-    HEADER_STATUS="bad-header"
-    header_ok "$TARGET_FILE" "$TARGET_DATE" && HEADER_STATUS="ok"
-
-    if wait "${AGENT_PIDS[$i]}" 2>/dev/null; then
-        if [ -f "$TARGET_FILE" ] && [ -s "$TARGET_FILE" ]; then
-            if [ "${AGENT_BEFORE_SHA[$i]}" = "missing" ]; then
-                AGENT_CREATE_COUNT=$((AGENT_CREATE_COUNT + 1))
-                log "  ✅ ${AGENT_NAMES[$i]} created (${SIZE}B; header=${HEADER_STATUS})"
-                record_task "summary" "${AGENT_NAMES[$i]}" "created" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};size=${SIZE};header=${HEADER_STATUS}"
-            elif [ "${AGENT_BEFORE_SHA[$i]}" = "$AFTER_SHA" ]; then
-                AGENT_UNCHANGED_COUNT=$((AGENT_UNCHANGED_COUNT + 1))
-                log "  ✅ ${AGENT_NAMES[$i]} unchanged (${SIZE}B; header=${HEADER_STATUS})"
-                record_task "summary" "${AGENT_NAMES[$i]}" "unchanged" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};size=${SIZE};header=${HEADER_STATUS}"
-            else
-                AGENT_UPDATE_COUNT=$((AGENT_UPDATE_COUNT + 1))
-                log "  ✅ ${AGENT_NAMES[$i]} updated (${SIZE}B; header=${HEADER_STATUS})"
-                record_task "summary" "${AGENT_NAMES[$i]}" "updated" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};size=${SIZE};header=${HEADER_STATUS}"
-            fi
-            if [ "$HEADER_STATUS" != "ok" ]; then
+            if [ ! -f "$TARGET_FILE" ] || [ "$SIZE" -le 0 ]; then
+                log "  ⚠️ ${agent}: no file content after successful agent call (attempt ${attempt})"
+                trace_event "phase1" "$agent" "invalid" "attempt=${attempt};reason=empty-or-missing;size=${SIZE};trace=$(basename "$TRACE_FILE")"
+                record_task "summary" "$agent" "invalid-empty" "$DURATION" "attempt=${attempt};sessions=${SESSION_COUNT};size=${SIZE};trace=$(basename "$TRACE_FILE")"
+            elif [ "$HEADER_STATUS" != "ok" ]; then
+                log "  ⚠️ ${agent}: invalid header after write (attempt ${attempt}; size=${SIZE}B)"
+                trace_event "phase1" "$agent" "invalid" "attempt=${attempt};reason=bad-header;size=${SIZE};trace=$(basename "$TRACE_FILE")"
+                record_task "summary" "$agent" "invalid-header" "$DURATION" "attempt=${attempt};sessions=${SESSION_COUNT};size=${SIZE};trace=$(basename "$TRACE_FILE")"
                 set_degraded
+            else
+                if [ "$BEFORE_SHA" = "missing" ]; then
+                    AGENT_CREATE_COUNT=$((AGENT_CREATE_COUNT + 1))
+                    STATUS="created"
+                elif [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+                    AGENT_UNCHANGED_COUNT=$((AGENT_UNCHANGED_COUNT + 1))
+                    STATUS="unchanged"
+                else
+                    AGENT_UPDATE_COUNT=$((AGENT_UPDATE_COUNT + 1))
+                    STATUS="updated"
+                fi
+                log "  ✅ ${agent} ${STATUS} (${SIZE}B; header=${HEADER_STATUS}; attempt=${attempt})"
+                trace_event "phase1" "$agent" "ok" "attempt=${attempt};status=${STATUS};size=${SIZE};prompt_sha=${PROMPT_SHA};trace=$(basename "$TRACE_FILE")"
+                record_task "summary" "$agent" "$STATUS" "$DURATION" "attempt=${attempt};sessions=${SESSION_COUNT};size=${SIZE};header=${HEADER_STATUS};prompt_sha=${PROMPT_SHA};trace=$(basename "$TRACE_FILE")"
+                success=1
+                break
             fi
         else
-            AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
-            log "  ⚠️ ${AGENT_NAMES[$i]}: agent returned OK but no file written"
-            record_task "summary" "${AGENT_NAMES[$i]}" "no-file" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]}"
+            DURATION="$(( $(now_epoch) - ATTEMPT_START ))"
+            log "  ❌ ${agent} failed (attempt ${attempt})"
+            trace_event "phase1" "$agent" "failed" "attempt=${attempt};mode=${MODE};trace=$(basename "$TRACE_FILE")"
+            record_task "summary" "$agent" "failed" "$DURATION" "attempt=${attempt};sessions=${SESSION_COUNT};mode=${MODE};prompt_sha=${PROMPT_SHA};trace=$(basename "$TRACE_FILE")"
         fi
-    else
+
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$success" -ne 1 ]; then
         AGENT_FAIL_COUNT=$((AGENT_FAIL_COUNT + 1))
-        log "  ❌ ${AGENT_NAMES[$i]} failed"
-        record_task "summary" "${AGENT_NAMES[$i]}" "failed" "$DURATION" "sessions=${AGENT_SESSION_COUNTS[$i]};mode=${AGENT_MODES[$i]}"
+        set_degraded
     fi
+
 done
 
 log "  📊 Results: ${AGENT_CREATE_COUNT} created, ${AGENT_UPDATE_COUNT} updated, ${AGENT_UNCHANGED_COUNT} unchanged, ${AGENT_FAIL_COUNT} failed"
 PHASE_RESULTS+=("phase1=${AGENT_CREATE_COUNT}create/${AGENT_UPDATE_COUNT}update/${AGENT_UNCHANGED_COUNT}same/${AGENT_FAIL_COUNT}fail")
-record_phase "phase1" "$([ "$AGENT_FAIL_COUNT" -gt 0 ] && echo degraded || echo ok)" "$(( $(now_epoch) - PHASE1_START ))" "created=${AGENT_CREATE_COUNT};updated=${AGENT_UPDATE_COUNT};unchanged=${AGENT_UNCHANGED_COUNT};failed=${AGENT_FAIL_COUNT};target=${TARGET_DATE}"
+record_phase "phase1" "$( [ "$AGENT_FAIL_COUNT" -gt 0 ] && echo degraded || echo ok )" "$(( $(now_epoch) - PHASE1_START ))" "created=${AGENT_CREATE_COUNT};updated=${AGENT_UPDATE_COUNT};unchanged=${AGENT_UNCHANGED_COUNT};failed=${AGENT_FAIL_COUNT};target=${TARGET_DATE};retries=${AGENT_SUMMARY_RETRIES};settle_timeout=${FILE_SETTLE_TIMEOUT_S}"
 
 AGENT_NOTES_AVAILABLE=false
 if [ $((AGENT_CREATE_COUNT + AGENT_UPDATE_COUNT + AGENT_UNCHANGED_COUNT)) -gt 0 ]; then
@@ -542,13 +607,24 @@ Data sources (read what's available, skip what's not):
 3. Previous briefing for dedup: ${BRIEFING_DIR}/${TARGET_DATE}.md
 4. Weather: use the weather tool for Vienna
 
-Compose briefing with:
-Section 1: Your Day (weather, highlights from ${TARGET_DATE}, pending items)
-Section 2: System Health (brief: any issues from agent notes)
+Compose briefing with short readable prose, not bullet spam.
+
+Sections:
+1. Your Day — weather, highlights from ${TARGET_DATE}, pending items.
+2. Quiet successful cron runs — only include this section if you can verify jobs that ran successfully today and produced no user-facing result. Keep it compact: one short intro line plus job titles only.
+3. System Health — only brief relevant issues from agent notes.
+
+For the quiet successful cron runs section:
+- Use the cron tool to inspect jobs and today's run state.
+- Mention only jobs that really ran successfully today.
+- Mention only jobs that produced no notable new result / no separate actionable message.
+- Do not mention failed, skipped, disabled, or merely scheduled jobs.
+- Keep this section compact so humans regain oversight without scroll hell.
 
 Critical:
 - The briefing is for TODAY (${DATE}) but summarizes the COMPLETED PRIOR DAY (${TARGET_DATE})
 - NO stale content. Short+fresh > long+stale.
+- Prefer short paragraphs or very small lists.
 - Keep it under 300 words.
 
 Archive to: ${BRIEFING_FILE}
@@ -628,6 +704,8 @@ log ""
 log "════════════════════════════════════════"
 log "💙 Pipeline End: $(date +%H:%M:%S) (${SECONDS}s)"
 log "════════════════════════════════════════"
+
+trace_event "run" "pipeline" "end" "status=${FINAL_STATUS};duration=${SECONDS};phases=${PHASE_RESULTS[*]};tasks=$(basename "$TASKS_LOG");phases_tsv=$(basename "$PHASES_LOG")"
 
 rm -f "$STATUS_FILE"
 exit 0
